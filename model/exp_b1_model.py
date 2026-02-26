@@ -427,6 +427,34 @@ class ExpB1Model(nn.Module):
         """
         # 返回所有参数
         return [{"params": self.parameters()}]
+    def extract_features(self, images: torch.Tensor) -> torch.Tensor:
+        """
+        提取图像的语义特征（用于原型分离比计算等）
+
+        参数：
+            images: 输入图像 [B, 3, H, W]
+
+        返回：
+            features: 语义嵌入 [B, 640]（已归一化）
+        """
+        # 提取金字塔特征
+        pyramid_features = self.backbone(images)  # {f1, f2, f3, f4}
+
+        # 语义分支处理
+        f4 = pyramid_features["f4"]  # [B, 640, h, w]
+        f4_pooled = F.adaptive_avg_pool2d(f4, (1, 1)).flatten(1)  # [B, 640]
+
+        # 语义潜码编码
+        u_c = self.sem_encoder(f4_pooled)  # [B, 256]
+
+        # 语义投影到子空间
+        z_c_raw = self.joint_basis.project_semantic(u_c)  # [B, 640]
+
+        # L2 归一化
+        z_c = F.normalize(z_c_raw, dim=1, eps=1e-8)  # [B, 640]
+
+        return z_c
+
 
     def get_model_info(self):
         """
