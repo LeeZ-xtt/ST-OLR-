@@ -62,6 +62,7 @@ class Config:
     """
     # ExpB1Model模型参数
     metric = "euclidean"  # 原型网络距离度量
+    proto_temperature = 5.0  # 原型网络温度参数（用于缩放距离/相似度）
     intrinsic_encoder_drop_rate = 0.2  # 本征编码器ResNet12的Dropout率
     use_blurpool = True  # 是否使用BlurPool进行抗锯齿下采样（默认启用）
 
@@ -80,8 +81,16 @@ class Config:
     loss_weight_cls = 1.0  # 分类损失权重
     loss_weight_domain = 0.1  # 域分类损失权重
     loss_weight_hsic = (
-        0.1  # HSIC 独立性损失权重 (从0.01提升至0.1，因HSIC原始值通常在1e-3~1e-1)
+        0.01  # HSIC 独立性损失权重 (从0.01提升至0.1，因HSIC原始值通常在1e-3~1e-1)
     )
+
+    # ===== 反事实一致性配置 =====
+    loss_weight_cf_sema = 0.5  # 反事实语义不变性损失权重
+    loss_weight_sf = 0.2  # 风格跟随损失权重
+
+    # Warmup 调度
+    cf_start_epoch = 6  # 反事实损失开始生效的 epoch（1-indexed，前 5 个 epoch 不启用）
+    cf_rampup_epochs = 5  # 从 0 线性升到目标权重的 epoch 数
 
     # 打印设备信息
     @classmethod
@@ -112,8 +121,19 @@ class Config:
             raise ValueError(
                 f"HSIC独立性损失权重必须非负，得到: {cls.loss_weight_hsic}"
             )
+        if cls.loss_weight_cf_sema < 0:
+            raise ValueError(
+                f"反事实语义损失权重必须非负，得到: {cls.loss_weight_cf_sema}"
+            )
+        if cls.loss_weight_sf < 0:
+            raise ValueError(f"风格跟随损失权重必须非负，得到: {cls.loss_weight_sf}")
 
         print(f"✅ 损失权重配置验证通过:")
         print(f"   分类损失权重: {cls.loss_weight_cls}")
         print(f"   域分类损失权重: {cls.loss_weight_domain}")
         print(f"   HSIC独立性损失权重: {cls.loss_weight_hsic}")
+        print(f"   反事实语义损失权重: {cls.loss_weight_cf_sema}")
+        print(f"   风格跟随损失权重: {cls.loss_weight_sf}")
+        print(
+            f"   反事实 warmup: epoch {cls.cf_start_epoch} 开始, {cls.cf_rampup_epochs} epochs 线性升温"
+        )
