@@ -39,6 +39,7 @@ from utils.visualization import (
 )
 from utils.tsne_manager import TSNEVisualizer
 from model.module.stolr_losses import total_loss  # 导入总损失函数
+from model.module.counterfactual import counterfactual_forward  # 导入反事实前向函数
 
 
 def setup_environment(seed):
@@ -77,6 +78,7 @@ def create_model(config):
     # 创建ExpB1Model实例并直接部署到GPU
     model = ExpB1Model(
         metric=config.metric,  # 距离度量方式
+        proto_temperature=config.proto_temperature,  # 原型网络温度参数
         intrinsic_encoder_drop_rate=config.intrinsic_encoder_drop_rate,
         sem_olr_rank=config.sem_olr_rank,  # 语义OLR投影器的秩
         sem_olr_mlp_hidden=config.sem_olr_mlp_hidden,  # 语义OLR投影器的MLP隐藏层维度
@@ -490,6 +492,8 @@ def main():
         epoch_cls_losses = []
         epoch_domain_losses = []
         epoch_hsic_losses = []
+        epoch_cf_sema_losses = []
+        epoch_sf_losses = []
 
         layer_weights = None
         epoch_sep_ratios = [] if (epoch + 1) % 5 == 0 else None
@@ -566,16 +570,31 @@ def main():
                     outputs["support_domains"] = support_domains
                     outputs["query_domains"] = query_domains
 
-                    # 使用 stolr_losses.total_loss 统一计算所有损失
-                    loss_weights = {
-                        "cls": Config.loss_weight_cls,
-                        "domain": Config.loss_weight_domain,
-                        "hsic": Config.loss_weight_hsic,
-                    }
-                    losses = total_loss(outputs, query_labels, loss_weights)
+                    # ===== 反事实前向（训练期） =====
+                    cf_outputs = None
+                    if model.training:
+                        B_total = outputs["f1"].shape[0]
+                        perm = torch.randperm(B_total, device=Config.device)
+                        cf_outputs = counterfactual_forward(
+                            model,
+                            f1=outputs["f1"],
+                            f2=outputs["f2"],
+                            f3=outputs["f3"],
+                            perm=perm,
+                        )
+
+                    # 使用 stolr_losses.total_loss 统一计算所有损失（简化接口）
+                    losses = total_loss(
+                        outputs,
+                        query_labels,
+                        cf_outputs=cf_outputs,
+                        current_epoch=epoch + 1,  # 转换为 1-indexed
+                    )
                     cls_loss = losses["cls"]
                     domain_loss = losses["domain"]
                     loss_hsic = losses["hsic"]
+                    loss_cf_sema = losses["cf_sema"]
+                    loss_sf = losses["sf"]
                     total_loss_val = losses["total"]
             else:
                 outputs = run_episode(
@@ -593,16 +612,31 @@ def main():
                 outputs["support_domains"] = support_domains
                 outputs["query_domains"] = query_domains
 
-                # 使用 stolr_losses.total_loss 统一计算所有损失
-                loss_weights = {
-                    "cls": Config.loss_weight_cls,
-                    "domain": Config.loss_weight_domain,
-                    "hsic": Config.loss_weight_hsic,
-                }
-                losses = total_loss(outputs, query_labels, loss_weights)
+                # ===== 反事实前向（训练期） =====
+                cf_outputs = None
+                if model.training:
+                    B_total = outputs["f1"].shape[0]
+                    perm = torch.randperm(B_total, device=Config.device)
+                    cf_outputs = counterfactual_forward(
+                        model,
+                        f1=outputs["f1"],
+                        f2=outputs["f2"],
+                        f3=outputs["f3"],
+                        perm=perm,
+                    )
+
+                # 使用 stolr_losses.total_loss 统一计算所有损失（简化接口）
+                losses = total_loss(
+                    outputs,
+                    query_labels,
+                    cf_outputs=cf_outputs,
+                    current_epoch=epoch + 1,  # 转换为 1-indexed
+                )
                 cls_loss = losses["cls"]
                 domain_loss = losses["domain"]
                 loss_hsic = losses["hsic"]
+                loss_cf_sema = losses["cf_sema"]
+                loss_sf = losses["sf"]
                 total_loss_val = losses["total"]
 
             # HSIC 调试日志（仅在前 N 个 episode 打印）
@@ -692,6 +726,22 @@ def main():
                 print(f"   当前学习率: {scheduler.get_lr():.6f}")
                 raise ValueError("HSIC独立性损失包含NaN，训练终止")
 
+            # 反事实损失 NaN 检测（自动判断是否激活）
+            if epoch + 1 >= Config.cf_start_epoch:
+                if torch.isnan(loss_cf_sema):
+                    print(
+                        f"\n❌ NaN损失检测到在Epoch {epoch + 1}, Episode {episode_idx + 1}:"
+                    )
+                    print(f"   反事实语义损失(loss_cf_sema): {loss_cf_sema.item()}")
+                    raise ValueError("反事实语义损失包含NaN，训练终止")
+
+                if torch.isnan(loss_sf):
+                    print(
+                        f"\n❌ NaN损失检测到在Epoch {epoch + 1}, Episode {episode_idx + 1}:"
+                    )
+                    print(f"   风格跟随损失(loss_sf): {loss_sf.item()}")
+                    raise ValueError("风格跟随损失包含NaN，训练终止")
+
             if torch.isnan(total_loss_val) or torch.isinf(total_loss_val):
                 print(f"\n❌ 总损失异常在Epoch {epoch + 1}, Episode {episode_idx + 1}:")
                 print(f"   总损失(total_loss_val): {total_loss_val.item()}")
@@ -764,6 +814,8 @@ def main():
             epoch_cls_losses.append(cls_loss.item())
             epoch_domain_losses.append(domain_loss.item())
             epoch_hsic_losses.append(loss_hsic.item())
+            epoch_cf_sema_losses.append(loss_cf_sema.item())
+            epoch_sf_losses.append(loss_sf.item())
 
             # 记录episode时间
             episode_time = time.time() - episode_start_time
@@ -798,6 +850,20 @@ def main():
                     f"    └─ 分类损失={avg_cls_loss:.4f}, 域损失={avg_domain_loss:.4f}, HSIC损失={avg_hsic_loss:.6f}"
                 )
 
+                # 反事实损失日志（自动判断是否激活）
+                avg_cf_sema = np.mean(epoch_cf_sema_losses[-Config.log_interval :])
+                avg_sf = np.mean(epoch_sf_losses[-Config.log_interval :])
+                if avg_cf_sema > 1e-6 or avg_sf > 1e-6:  # 如果损失非零，说明已激活
+                    # 计算当前 warmup 进度
+                    if epoch + 1 >= Config.cf_start_epoch:
+                        epochs_since_start = (epoch + 1) - Config.cf_start_epoch
+                        cf_weight = min(1.0, epochs_since_start / Config.cf_rampup_epochs)
+                    else:
+                        cf_weight = 0.0
+                    print(
+                        f"    └─ 反事实语义={avg_cf_sema:.4f}, 风格跟随={avg_sf:.4f}, cf_weight={cf_weight:.2f}"
+                    )
+
         # 计算epoch统计信息
         avg_epoch_loss = np.mean(epoch_losses)
         avg_epoch_acc = np.mean(epoch_accuracies)
@@ -808,6 +874,8 @@ def main():
         avg_epoch_cls_loss = np.mean(epoch_cls_losses)
         avg_epoch_domain_loss = np.mean(epoch_domain_losses)
         avg_epoch_hsic_loss = np.mean(epoch_hsic_losses)
+        avg_epoch_cf_sema_loss = np.mean(epoch_cf_sema_losses)
+        avg_epoch_sf_loss = np.mean(epoch_sf_losses)
 
         # 计算并记录epoch统计信息（均值、标准差、标准误差）
         epoch_mean, epoch_std, epoch_se = compute_epoch_statistics(epoch_accuracies)
@@ -825,6 +893,11 @@ def main():
         print(
             f"    └─ 分类损失={avg_epoch_cls_loss:.4f}, 域损失={avg_epoch_domain_loss:.4f}, HSIC损失={avg_epoch_hsic_loss:.6f}"
         )
+        # 反事实损失日志（自动判断是否激活）
+        if avg_epoch_cf_sema_loss > 1e-6 or avg_epoch_sf_loss > 1e-6:
+            print(
+                f"    └─ 反事实语义={avg_epoch_cf_sema_loss:.4f}, 风格跟随={avg_epoch_sf_loss:.4f}"
+            )
         print(
             f"  Time Summary: Epoch={epoch_time:.2f}s, Avg Episode={avg_episode_time:.2f}s"
         )
@@ -844,6 +917,16 @@ def main():
             # 记录T-SNE指标
             tsne_metrics_history.append(tsne_metrics)
             tsne_epochs.append(epoch + 1)
+
+            # ===== A_s 梯度诊断 =====
+            # 自动判断反事实损失是否激活（通过检查当前 epoch）
+            if epoch + 1 >= Config.cf_start_epoch:
+                orig_weight = model.joint_basis._basis.parametrizations.weight.original
+                if orig_weight.grad is not None:
+                    grad_norm = orig_weight.grad.norm().item()
+                    print(f"  📊 Q (Stiefel basis) gradient norm: {grad_norm:.6f}")
+                else:
+                    print(f"  ⚠️  Q gradient is None (反事实损失可能未正确回流)")
 
         # 根据配置参数评估验证集性能
         if (epoch + 1) % Config.eval_frequency == 0:
