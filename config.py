@@ -81,7 +81,7 @@ class Config:
     loss_weight_cls = 1.0  # 分类损失权重
     loss_weight_domain = 0.1  # 域分类损失权重
     loss_weight_hsic = (
-        0.01  # HSIC 独立性损失权重 (从0.01提升至0.1，因HSIC原始值通常在1e-3~1e-1)
+        0.1  # HSIC 独立性损失权重 (从0.01提升至0.1，因HSIC原始值通常在1e-3~1e-1)
     )
 
     # ===== 反事实一致性配置 =====
