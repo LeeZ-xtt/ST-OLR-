@@ -37,6 +37,7 @@ class ExpB1Model(nn.Module):
 
     Args:
         metric: 原型网络的距离度量 ('euclidean' 或 'cosine')
+        proto_temperature: 原型网络温度参数，用于缩放距离/相似度，默认10.0
         intrinsic_encoder_drop_rate: 本征编码器ResNet12残差块Dropout率
         sem_olr_rank: 语义OLR投影器的秩，默认256
         sem_olr_mlp_hidden: 语义OLR投影器的MLP隐藏层维度，默认512
@@ -50,6 +51,7 @@ class ExpB1Model(nn.Module):
     def __init__(
         self,
         metric: str = "euclidean",
+        proto_temperature: float = 10.0,
         intrinsic_encoder_drop_rate: float = 0.2,
         sem_olr_rank: int = 128,
         sem_olr_mlp_hidden: int = 512,
@@ -65,6 +67,7 @@ class ExpB1Model(nn.Module):
         super().__init__()
 
         self.metric = metric
+        self.proto_temperature = proto_temperature
         self.detach_style_inputs = detach_style_inputs
         self.sem_olr_rank = sem_olr_rank
         self.style_olr_rank = style_olr_rank
@@ -111,7 +114,9 @@ class ExpB1Model(nn.Module):
         #     rank=sem_olr_rank,
         #     mlp_hidden=sem_olr_mlp_hidden
         # )
-        self.proto_head = PrototypeNetwork(metric=metric, temperature=10.0)
+        self.proto_head = PrototypeNetwork(
+            metric=metric, temperature=proto_temperature
+        )
 
         # 风格分支
         # self.style_branch = STOLRStyleBranch(
@@ -158,6 +163,103 @@ class ExpB1Model(nn.Module):
         trainable_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
         print(f"   总参数: {total_params:,}")
         print(f"   可训练参数: {trainable_params:,}")
+
+    def encode_style_features(
+        self,
+        style_pyramid: Dict[str, torch.Tensor],
+        return_intermediates: bool = False,
+    ) -> Dict[str, torch.Tensor]:
+        """
+        风格特征编码管线（7步链式调用的封装）
+
+        将金字塔特征 {f1, f2, f3} 编码为风格嵌入 z_s 和风格潜码 u_s。
+        此方法封装了完整的风格管线流程，避免代码重复。
+
+        流程：
+            1. stats_tokenizer: 统计Token化 [B, 30, 128]
+            2. patch_tokenizer: Patch Token化 List[3 × [B, n_i, 128]]
+            3. cross_attn_agg: 跨尺度注意力聚合 [B, 24, 128]
+            4. cat: 合并统计和Patch tokens [B, 54, 128]
+            5. token_mixer: Transformer混合 [B, 54, 128]
+            6. attn_pool: 注意力池化 [B, 128]
+            7. sty_encoder: 潜码编码 [B, rank_s]
+            8. project_style: 投影到风格子空间 [B, 640]
+            9. normalize: L2归一化 [B, 640]
+
+        Args:
+            style_pyramid: 金字塔特征字典，包含:
+                - "f1": [B, 64, H1, W1] 早期特征
+                - "f2": [B, 160, H2, W2] 中期特征
+                - "f3": [B, 320, H3, W3] 中期特征
+                注意：调用方应已处理 detach（如果需要）
+            return_intermediates: 是否返回中间特征（用于调试/可视化）
+
+        Returns:
+            dict 包含:
+                - "z_s": [B, 640] 归一化的风格嵌入
+                - "u_s": [B, rank_s] 风格潜码
+                - "token_agg": [B, 128] 风格Token聚合特征（如果 return_intermediates=True）
+                - "all_style_tokens": [B, 54, 128] 所有风格tokens（如果 return_intermediates=True）
+
+        Raises:
+            RuntimeError: 当检测到 NaN/Inf 时
+
+        注意：
+            - 此方法不处理 detach 逻辑（由调用方负责）
+            - 梯度可正常回流至所有风格管线模块
+            - 适用于正常前向和反事实前向
+        """
+        # 步骤 1: 统计 Token 化
+        stats_tokens = self.stats_tokenizer(style_pyramid)  # [B, 30, 128]
+
+        # 步骤 2: Patch Token 化
+        patch_tokens_list = self.patch_tokenizer(style_pyramid)  # List[3 × [B, n_i, 128]]
+
+        # 步骤 3: 跨尺度注意力聚合
+        patch_tokens = self.cross_attn_agg(patch_tokens_list)  # [B, 24, 128]
+
+        # 步骤 4: 合并所有风格 tokens
+        all_style_tokens = torch.cat([stats_tokens, patch_tokens], dim=1)  # [B, 54, 128]
+
+        # 步骤 5: NaN/Inf 检测
+        if torch.isnan(all_style_tokens).any() or torch.isinf(all_style_tokens).any():
+            raise RuntimeError("检测到 NaN/Inf 在 all_style_tokens 中")
+
+        # 步骤 6: Token 混合
+        mixed_tokens = self.token_mixer(all_style_tokens)  # [B, 54, 128]
+
+        # 步骤 7: 注意力池化
+        token_agg = self.attn_pool(mixed_tokens)  # [B, 128]
+
+        # 步骤 8: NaN/Inf 检测
+        if torch.isnan(token_agg).any() or torch.isinf(token_agg).any():
+            raise RuntimeError("检测到 NaN/Inf 在 token_agg 中")
+
+        # 步骤 9: 风格潜码编码
+        u_s = self.sty_encoder(token_agg)  # [B, rank_s]
+
+        # 步骤 10: 风格投影到子空间
+        z_s_raw = self.joint_basis.project_style(u_s)  # [B, 640]
+
+        # 步骤 11: L2 归一化
+        z_s = F.normalize(z_s_raw, dim=1, eps=1e-8)  # [B, 640]
+
+        # 步骤 12: NaN/Inf 检测
+        if torch.isnan(z_s).any() or torch.isinf(z_s).any():
+            raise RuntimeError("检测到 NaN/Inf 在风格嵌入 z_s 中")
+
+        # 构建返回字典
+        result = {
+            "z_s": z_s,  # [B, 640]
+            "u_s": u_s,  # [B, rank_s]
+        }
+
+        # 可选返回中间特征
+        if return_intermediates:
+            result["token_agg"] = token_agg  # [B, 128]
+            result["all_style_tokens"] = all_style_tokens  # [B, 54, 128]
+
+        return result
 
     def forward(
         self,
@@ -255,9 +357,8 @@ class ExpB1Model(nn.Module):
             z_c_support, support_labels, z_c_query, n_way
         )  # logits: [N_q, n_way], prototypes: [n_way, 640]
 
-        # === 步骤 6: 风格分支处理（多尺度多因子Token化） ===
-        # 第一步：构建风格输入，只包含 f1, f2, f3（不包含 f4）
-        # f4 是高语义层，文档明确说域支只读早/中层
+        # === 步骤 6: 风格分支处理（使用封装的风格编码管线） ===
+        # 构建风格输入金字塔（处理 detach 逻辑）
         style_pyramid = {
             "f1": pyramid_features["f1"].detach()
             if self.detach_style_inputs
@@ -270,55 +371,13 @@ class ExpB1Model(nn.Module):
             else pyramid_features["f3"],
         }
 
-        # 第二步：统计 Token 化
-        stats_tokens = self.stats_tokenizer(style_pyramid)  # [B_total, 22, 128]
-
-        # 第三步：Patch Token 化 + Cross-Attn 聚合
-        patch_tokens_list = self.patch_tokenizer(
-            style_pyramid
-        )  # List of 3 × [B, n_i, 128]
-        patch_tokens = self.cross_attn_agg(patch_tokens_list)  # [B_total, 24, 128]
-
-        # 第四步：合并所有风格 tokens
-        all_style_tokens = torch.cat(
-            [stats_tokens, patch_tokens], dim=1
-        )  # [B_total, 46, 128]
-
-        # 第五步：NaN/Inf 检测
-        if torch.isnan(all_style_tokens).any() or torch.isinf(all_style_tokens).any():
-            raise RuntimeError("检测到 NaN/Inf 在 all_style_tokens 中")
-
-        # 第六步：Token 混合
-        mixed_tokens = self.token_mixer(all_style_tokens)  # [B_total, 46, 128]
-
-        # 第七步：注意力池化（替代 mean pooling）
-        token_agg = self.attn_pool(mixed_tokens)  # [B_total, 128]
-
-        # 第八步：NaN/Inf 检测
-        if torch.isnan(token_agg).any() or torch.isinf(token_agg).any():
-            raise RuntimeError("检测到 NaN/Inf 在 token_agg 中")
-
-        # 风格潜码编码
-        u_s = self.sty_encoder(token_agg)  # [B_total, 64]
-
-        # 风格投影到子空间
-        z_s_raw = self.joint_basis.project_style(u_s)  # [B_total, 640]
-
-        # L2 归一化
-        z_s = F.normalize(z_s_raw, dim=1, eps=1e-8)  # [B_total, 640]
-
-        # 检测 NaN/Inf
-        if torch.isnan(z_s).any() or torch.isinf(z_s).any():
-            raise RuntimeError("检测到 NaN/Inf 在风格嵌入 z_s 中")
-
-        # === 旧风格分支代码（已注释） ===
-        # style_features = {
-        #     "f1": pyramid_features["f1"],
-        #     "f2": pyramid_features["f2"],
-        #     "f3": pyramid_features["f3"]
-        # }
-        # u_s, z_s, domain_logits = self.style_branch(style_features)
-        # # u_s: [B_total, 64], z_s: [B_total, 640], domain_logits: [B_total, 4]
+        # 调用封装的风格编码管线
+        style_outputs = self.encode_style_features(
+            style_pyramid, return_intermediates=True
+        )
+        z_s = style_outputs["z_s"]  # [B_total, 640]
+        u_s = style_outputs["u_s"]  # [B_total, rank_s]
+        token_agg = style_outputs["token_agg"]  # [B_total, 128]
 
         # === 步骤 7: 域分类（使用风格潜码 u_s） ===
         domain_logits = self.domain_head(u_s)  # [B_total, 4]
@@ -335,6 +394,10 @@ class ExpB1Model(nn.Module):
             "domain_logits": domain_logits,  # [B_total, 4]
             "support_domains": support_domains,  # [N_s]
             "query_domains": query_domains,  # [N_q]
+            # ===== 反事实路径所需的中间特征 =====
+            "f1": pyramid_features["f1"],  # [B_total, 64, H1, W1]
+            "f2": pyramid_features["f2"],  # [B_total, 160, H2, W2]
+            "f3": pyramid_features["f3"],  # [B_total, 320, H3, W3]
         }
 
     def set_mode(self, mode):
