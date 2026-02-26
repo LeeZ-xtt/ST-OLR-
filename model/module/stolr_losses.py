@@ -144,13 +144,94 @@ class HSICIndependenceLoss(nn.Module):
 _HSIC_LOSS = HSICIndependenceLoss()
 
 
+def counterfactual_semantic_loss(
+    z_c: torch.Tensor,
+    z_c_cf: torch.Tensor,
+    prototypes: torch.Tensor,
+    temperature: float = 10.0,
+) -> torch.Tensor:
+    """
+    反事实语义不变性损失 L_cf_sema
+
+    确保语义嵌入 z_c 对风格干预不变：
+    对风格做 do-干预后，分类概率分布应保持不变。
+
+    数学公式：
+        p_orig_i = softmax(-temperature * ||z_c[i] - p_k||^2)  ∀k
+        p_cf_i   = softmax(-temperature * ||z_c_cf[i] - p_k||^2)  ∀k
+        L = mean_i KL(p_orig_i || p_cf_i)
+
+    Args:
+        z_c:         正常路径语义嵌入 [B, 640]，已 L2 归一化
+        z_c_cf:      反事实路径语义嵌入 [B, 640]，已 L2 归一化
+        prototypes:  类别原型 [n_way, 640]，来自正常路径的 proto_head 输出
+        temperature: softmax 温度参数（与原型网络一致，默认 10.0）
+
+    Returns:
+        loss: 标量。值越小表示语义对风格越不变。
+
+    梯度流：
+        - 原始分布 p_orig 被 detach，梯度不回流至正常路径的 z_c
+        - 梯度仅通过 p_cf 回流至反事实路径的 z_c_cf
+        - 原型 prototypes 被 detach，避免循环梯度
+    """
+    dists_orig = -temperature * torch.cdist(z_c, prototypes.detach()).pow(2)
+    p_orig = F.softmax(dists_orig, dim=1).detach()
+
+    dists_cf = -temperature * torch.cdist(z_c_cf, prototypes.detach()).pow(2)
+    log_p_cf = F.log_softmax(dists_cf, dim=1)
+
+    loss = F.kl_div(log_p_cf, p_orig, reduction="batchmean")
+
+    return loss
+
+
+def style_following_loss(
+    z_s_cf: torch.Tensor,
+    z_s: torch.Tensor,
+    perm: torch.Tensor,
+) -> torch.Tensor:
+    """
+    风格跟随损失 L_sf
+
+    使反事实路径的风格嵌入 z_s_cf 跟随风格提供者的 z_s。
+    这是修复 A_s 梯度断流的核心损失。
+
+    数学公式：
+        L = mean_i (1 - cos_sim(z_s_cf[i], z_s[perm[i]]))
+
+    Args:
+        z_s_cf:  反事实路径风格嵌入 [B, 640]，已 L2 归一化
+        z_s:     正常路径风格嵌入 [B, 640]，已 L2 归一化
+        perm:    风格配对排列索引 [B]（LongTensor）
+
+    Returns:
+        loss: 标量。值域 [0, 2]，0 表示完全对齐。
+
+    梯度流：
+        - z_s[perm] 被 detach，梯度不回流至正常路径的 z_s
+        - 梯度仅通过 z_s_cf 回流至：A_s（关键！）、sty_encoder、style pipeline
+    """
+    z_s_target = z_s[perm].detach()
+
+    cos_sim = F.cosine_similarity(z_s_cf, z_s_target, dim=1)
+
+    loss = (1.0 - cos_sim).mean()
+
+    return loss
+
+
 def total_loss(
     outputs: Dict[str, torch.Tensor],
     query_labels: torch.Tensor,
-    loss_weights: Dict[str, float],
+    cf_outputs: Optional[Dict[str, torch.Tensor]] = None,
+    current_epoch: int = 1,
+    config=None,
 ) -> Dict[str, torch.Tensor]:
     """
-    计算总损失
+    计算总损失（简化接口版本）
+
+    自动从 config 读取损失权重并计算反事实 warmup 系数。
 
     Args:
         outputs: 模型输出字典，包含:
@@ -162,11 +243,14 @@ def total_loss(
             - u_s: [B_total, rank_s] 风格潜码
             - support_domains: [N_s] 支持集域标签
             - query_domains: [N_q] 查询集域标签
+            - prototypes: [n_way, 640] 类别原型
         query_labels: 查询集标签 [N_q]
-        loss_weights: 损失权重字典，包含:
-            - cls: 分类损失权重
-            - domain: 域分类损失权重
-            - hsic: HSIC 独立性损失权重
+        cf_outputs: 反事实前向输出字典（训练期传入，推理期为None），包含:
+            - z_c_cf: [B, 640] 反事实语义嵌入
+            - z_s_cf: [B, 640] 反事实风格嵌入
+            - perm: [B] 排列索引
+        current_epoch: 当前训练 epoch（1-indexed），用于计算反事实 warmup
+        config: 配置对象（默认使用全局 Config）
 
     Returns:
         losses: 包含所有损失项的字典
@@ -174,7 +258,24 @@ def total_loss(
             - cls: 分类损失
             - domain: 域分类损失
             - hsic: HSIC 独立性损失
+            - cf_sema: 反事实语义损失
+            - sf: 风格跟随损失
     """
+    # 使用全局 Config 如果未提供
+    if config is None:
+        from config import Config
+
+        config = Config
+
+    # 计算反事实 warmup 系数
+    cf_is_active = current_epoch >= config.cf_start_epoch
+    if cf_is_active:
+        epochs_since_start = current_epoch - config.cf_start_epoch
+        cf_multiplier = min(1.0, epochs_since_start / config.cf_rampup_epochs)
+    else:
+        cf_multiplier = 0.0
+
+    # 计算各项损失
     loss_cls = F.cross_entropy(outputs["logits"], query_labels)
 
     all_domains = torch.cat(
@@ -188,10 +289,38 @@ def total_loss(
     else:
         loss_hsic = torch.tensor(0.0, device=outputs["u_c"].device)
 
+    # 反事实损失（仅在训练期且 warmup 后计算）
+    if cf_outputs is not None and cf_is_active:
+        loss_cf_sema = counterfactual_semantic_loss(
+            z_c=outputs["z_c"],
+            z_c_cf=cf_outputs["z_c_cf"],
+            prototypes=outputs["prototypes"],
+            temperature=config.proto_temperature,  # 从配置读取温度参数
+        )
+        loss_sf = style_following_loss(
+            z_s_cf=cf_outputs["z_s_cf"],
+            z_s=outputs["z_s"],
+            perm=cf_outputs["perm"],
+        )
+    else:
+        device = outputs["u_c"].device
+        loss_cf_sema = torch.tensor(0.0, device=device)
+        loss_sf = torch.tensor(0.0, device=device)
+
+    # 加权求和（反事实损失自动应用 warmup 系数）
     total = (
-        loss_weights["cls"] * loss_cls
-        + loss_weights["domain"] * loss_domain
-        + loss_weights["hsic"] * loss_hsic
+        config.loss_weight_cls * loss_cls
+        + config.loss_weight_domain * loss_domain
+        + config.loss_weight_hsic * loss_hsic
+        + config.loss_weight_cf_sema * cf_multiplier * loss_cf_sema
+        + config.loss_weight_sf * cf_multiplier * loss_sf
     )
 
-    return {"total": total, "cls": loss_cls, "domain": loss_domain, "hsic": loss_hsic}
+    return {
+        "total": total,
+        "cls": loss_cls,
+        "domain": loss_domain,
+        "hsic": loss_hsic,
+        "cf_sema": loss_cf_sema,
+        "sf": loss_sf,
+    }
