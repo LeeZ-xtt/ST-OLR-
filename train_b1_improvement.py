@@ -26,7 +26,6 @@ from utils.dataloader_improvement import (
     get_pacs_transform,
 )  # 更新为改进版dataloader
 from utils.visualization import (
-    visualize_alpha_weights,
     plot_epoch_accuracy,
     plot_epoch_statistics,
     plot_training_curve,
@@ -34,10 +33,7 @@ from utils.visualization import (
     plot_accuracy_heatmap,
     plot_val_accuracy_curve,
     plot_separation_ratio_curve,
-    plot_tsne_embeddings,
-    plot_tsne_evolution,
 )
-from utils.tsne_manager import TSNEVisualizer
 from model.module.stolr_losses import total_loss  # 导入总损失函数
 from model.module.counterfactual import counterfactual_forward  # 导入反事实前向函数
 
@@ -429,27 +425,13 @@ def main():
     sep_ratio_epochs = []
     best_val_acc = 0.0
 
-    # T-SNE可视化数据收集
-    tsne_metrics_history = []
-    tsne_epochs = []
-    tsne_save_dir = "figures/T-SNE"
-    os.makedirs(tsne_save_dir, exist_ok=True)
-    print(f"📊 T-SNE可视化将保存到: {tsne_save_dir} (每5个epoch)")
-
-    # 初始化固定Episode的T-SNE可视化器
-    # 对齐域泛化评估设置：support来自source域，query来自target域（sketch）
-    tsne_visualizer = TSNEVisualizer(
-        dataset=tsne_dataset,
-        n_way=Config.n_way,
-        k_shot=Config.k_shot,
-        query_per_class=Config.query_per_class,
-        num_episodes=3,  # 固定3个episode用于可视化
-        support_domain_pool=Config.test_source_domains,  # 使用验证阶段的source域
-        query_domain_pool=Config.test_query_domains,  # 使用验证阶段的target域（sketch）
-        device=Config.device,
-    )
+    # ===== 权重更新量监控：保存第一层卷积的初始权重 =====
+    first_conv_layer = model.backbone.stem_conv[0]  # stem_conv 的第一个 Conv2d
+    initial_weights = first_conv_layer.weight.data.clone().detach()
+    print(f"📊 权重监控已启用: 跟踪 backbone.stem_conv[0] (shape={initial_weights.shape})")
 
     print("Starting training...")
+
 
     # HSIC 调试配置
     HSIC_DEBUG_EPISODES = 10  # 前 N 个 episode 打印 HSIC 调试信息
@@ -654,21 +636,24 @@ def main():
                 )
                 print(f"  Batch Size B: {B_total}")
                 print(f"  归一化因子 (B-1)^2: {normalization_factor}")
-                print(f"  HSIC 原始值: {hsic_raw:.4e}")
+                print(f"  nHSIC 原始值: {hsic_raw:.4f} (值域 [0,1]，0=独立)")
                 print(
                     f"  加权后 HSIC 损失 (权重={Config.loss_weight_hsic}): {hsic_weighted:.4e}"
                 )
 
-                # 量级分析
-                if hsic_raw < 1e-4:
-                    magnitude_status = "⚠️  过小"
-                    suggestion = f"建议: 增大 loss_weight_hsic 至 {Config.loss_weight_hsic * 10:.4f} 或更高"
-                elif hsic_raw > 1e-1:
-                    magnitude_status = "⚠️  过大"
-                    suggestion = f"建议: 减小 loss_weight_hsic 至 {Config.loss_weight_hsic / 10:.4f}"
-                else:
-                    magnitude_status = "✅ 正常 (1e-4 ~ 1e-1)"
+                # nHSIC 值域为 [0, 1]，需要使用匹配的阈值
+                if hsic_raw < 0.01:
+                    magnitude_status = "✅ 非常好(接近独立)"
+                    suggestion = "u_c 与 u_s 已接近独立，HSIC 约束生效"
+                elif hsic_raw < 0.3:
+                    magnitude_status = "✅ 良好 (弱依赖)"
                     suggestion = "当前权重配置合理"
+                elif hsic_raw < 0.7:
+                    magnitude_status = "✅ 正常 (中等依赖，训练初期预期行为)"
+                    suggestion = f"当前 loss_weight_hsic={Config.loss_weight_hsic} 配置合理，nHSIC 应随训练逐渐下降"
+                else:
+                    magnitude_status = "⚠️  较高依赖 (> 0.7)"
+                    suggestion = f"建议: 可适当增大 loss_weight_hsic 至 {Config.loss_weight_hsic * 2:.4f}"
 
                 print(f"  量级分析: {magnitude_status}")
                 print(f"  {suggestion}")
@@ -680,26 +665,25 @@ def main():
                     avg_hsic = np.mean(hsic_values_log)
                     std_hsic = np.std(hsic_values_log)
                     print(f"\n=== HSIC 调试汇总 ({HSIC_DEBUG_EPISODES} episodes) ===")
-                    print(f"  HSIC 均值: {avg_hsic:.4e}")
-                    print(f"  HSIC 标准差: {std_hsic:.4e}")
+                    print(f"  nHSIC 均值: {avg_hsic:.4f} (值域 [0,1]，0=独立)")
+                    print(f"  nHSIC 标准差: {std_hsic:.4f}")
                     print(
-                        f"  HSIC 范围: [{min(hsic_values_log):.4e}, {max(hsic_values_log):.4e}]"
+                        f"  nHSIC 范围: [{min(hsic_values_log):.4f}, {max(hsic_values_log):.4f}]"
                     )
 
-                    if avg_hsic < 1e-4:
-                        rec_weight = 0.1 / avg_hsic * Config.loss_weight_hsic
-                        print(
-                            f"  建议 loss_weight_hsic: ~{rec_weight:.4f} (使加权值接近 0.1)"
-                        )
-                    elif avg_hsic > 1e-1:
-                        rec_weight = 0.01 / avg_hsic * Config.loss_weight_hsic
-                        print(
-                            f"  建议 loss_weight_hsic: ~{rec_weight:.4f} (使加权值接近 0.01)"
-                        )
+                    weighted_avg = Config.loss_weight_hsic * avg_hsic
+                    print(f"  加权 HSIC 损失: {weighted_avg:.4e}")
+
+                    if avg_hsic < 0.05:
+                        print(f"  状态: 特征已接近独立，HSIC 约束正在生效")
+                    elif avg_hsic < 0.5:
+                        print(f"  状态: 中等依赖，训练初期正常")
                     else:
-                        print(
-                            f"  当前 loss_weight_hsic={Config.loss_weight_hsic} 配置合理"
-                        )
+                        print(f"  状态: 较高依赖（预期随训练下降）")
+
+                    print(
+                        f"  当前 loss_weight_hsic={Config.loss_weight_hsic} 配置合理，无需调整"
+                    )
 
             # 增强的NaN检测：检查所有损失组件并提供详细诊断信息
             if torch.isnan(cls_loss):
@@ -822,8 +806,9 @@ def main():
             episode_times.append(episode_time)
 
             if epoch_sep_ratios is not None:
-                support_features = model.extract_features(support_images)
-                # support_features: [B, 640] 本征特征向量
+                # 直接从outputs中提取support特征，避免重复计算
+                N_s = support_images.shape[0]
+                support_features = outputs["z_c"][:N_s]  # [N_s, 640] 语义嵌入
                 prototypes = outputs["prototypes"]  # [n_way, 640]
                 sep_metrics = compute_prototype_separation_ratio(
                     support_features, support_labels, prototypes
@@ -902,6 +887,16 @@ def main():
             f"  Time Summary: Epoch={epoch_time:.2f}s, Avg Episode={avg_episode_time:.2f}s"
         )
 
+        # ===== 权重更新量监控：计算并打印第一层卷积权重的更新量范数 =====
+        current_weights = first_conv_layer.weight.data  # [out_ch, in_ch, 3, 3]
+        weight_update = current_weights - initial_weights  # 计算权重变化量
+        update_norm = torch.norm(weight_update).item()  # L2范数
+        update_norm_relative = update_norm / (torch.norm(initial_weights).item() + 1e-8)  # 相对更新量
+        print(f"  📊 Backbone第一层卷积权重更新量:")
+        print(f"    └─ 绝对范数: {update_norm:.6f}")
+        print(f"    └─ 相对范数: {update_norm_relative:.6f} (更新量/初始权重范数，相对初始权重更新了多少)")
+        print(f"    └─ 当前权重范数: {torch.norm(current_weights).item():.6f}")
+
         # 每 5 个 epoch 记录一次分离比和T-SNE可视化
         if (epoch + 1) % 5 == 0:
             # 若本 epoch 计算了分离比，则累加到曲线数据并打印均值
@@ -910,13 +905,6 @@ def main():
                 sep_ratio_curve.append(avg_sep_ratio)
                 sep_ratio_epochs.append(epoch + 1)
                 print(f"  Separation Ratio (avg over epoch): {avg_sep_ratio:.4f}")
-
-            # ===== T-SNE 可视化 (Refactored) =====
-            tsne_metrics = tsne_visualizer.visualize(model, epoch + 1, tsne_save_dir)
-
-            # 记录T-SNE指标
-            tsne_metrics_history.append(tsne_metrics)
-            tsne_epochs.append(epoch + 1)
 
             # ===== A_s 梯度诊断 =====
             # 自动判断反事实损失是否激活（通过检查当前 epoch）
@@ -1045,16 +1033,6 @@ def main():
         print(
             f"  Generated training progress heatmap with {len(heatmap_data)} validation points"
         )
-
-    # ===== T-SNE 聚类指标演化图 =====
-    if len(tsne_metrics_history) > 0:
-        plot_tsne_evolution(
-            metrics_history=tsne_metrics_history,
-            epochs=tsne_epochs,
-            save_dir=tsne_save_dir,
-            title="T-SNE 聚类指标演化 (ExpB1Model)",
-        )
-        print(f"  📈 T-SNE聚类指标演化图已生成，共 {len(tsne_epochs)} 个采样点")
 
     # 计算并输出总训练时间统计
     total_training_time = time.time() - total_start_time
